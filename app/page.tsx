@@ -3,9 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import * as ort from "onnxruntime-web";
 
-const MODEL_URL = "/models/egyptian_cards_yolov11n_pose_v1.onnx";
+const MODEL_URL = "/yolo11n_pose_7class_v1.onnx";
 const IMG_SIZE = 640;
-const NUM_CLASSES = 6;
+const NUM_CLASSES = 7;
 const NUM_KPTS = 4;
 const CONF_THRES = 0.35;
 const IOU_THRES = 0.45;
@@ -17,6 +17,7 @@ const CLASS_NAMES = [
   "New_Car_Back",
   "Old_Card_Front",
   "Old_Card_Back",
+  "Other_Card"
 ];
 
 const KPT_NAMES = ["TL", "TR", "BR", "BL"];
