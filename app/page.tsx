@@ -3,29 +3,32 @@
 import { useEffect, useRef, useState } from "react";
 import * as ort from "onnxruntime-web";
 
-const MODEL_URL = "/yolo11n_pose_7class_v1.onnx";
+const MODEL_URL = "/yolo11n_pose_7class_v1.onnx?v=mrz1";
 const IMG_SIZE = 640;
-const NUM_CLASSES = 7;
+const NUM_CLASSES = 1;
 const NUM_KPTS = 4;
 const CONF_THRES = 0.35;
 const IOU_THRES = 0.45;
 
-const CLASS_NAMES = [
-  "ID_Card_Front",
-  "ID_Card_Back",
-  "New_Card_Front",
-  "New_Car_Back",
-  "Old_Card_Front",
-  "Old_Card_Back",
-  "Other_Card"
-];
+const CLASS_NAME = "mrz_td3";
 
 const KPT_NAMES = ["TL", "TR", "BR", "BL"];
+// TL red, TR orange, BR cyan, BL magenta — wrong corner order is visible at a glance
+const KPT_COLORS = ["#EF4444", "#F97316", "#06B6D4", "#EC4899"];
+
+// Target rectified strip. MRZ TD3 strip aspect is ~7:1.
+const MRZ_STRIP_W = 1000;
+const MRZ_STRIP_H = 156;
+// Quad expansion so the perspective warp doesn't clip the first/last characters
+// (the model predicts a tight box around the glyphs themselves).
+const MRZ_EXPAND_ALONG = 0.03; // along the text direction (TL-TR / BL-BR edges)
+const MRZ_EXPAND_ACROSS = 0.12; // across the text direction (TL-BL / TR-BR edges)
+
+type Point = { x: number; y: number };
 
 type Detection = {
   box: [number, number, number, number];
   score: number;
-  cls: number;
   kpts: { x: number; y: number; conf: number }[];
 };
 
@@ -128,14 +131,139 @@ function preprocessVideo(video: HTMLVideoElement) {
   };
 }
 
+// Expand a quad outward along its own edge vectors so the warp doesn't clip
+// text right at the predicted box edge. TL,TR,BR,BL order is preserved.
+function expandQuad(
+  pts: [Point, Point, Point, Point],
+  alongRatio: number,
+  acrossRatio: number
+): [Point, Point, Point, Point] {
+  const [tl, tr, br, bl] = pts;
+
+  const alongTop = { x: tr.x - tl.x, y: tr.y - tl.y };
+  const alongBottom = { x: br.x - bl.x, y: br.y - bl.y };
+  const acrossLeft = { x: bl.x - tl.x, y: bl.y - tl.y };
+  const acrossRight = { x: br.x - tr.x, y: br.y - tr.y };
+
+  return [
+    {
+      x: tl.x - alongTop.x * alongRatio - acrossLeft.x * acrossRatio,
+      y: tl.y - alongTop.y * alongRatio - acrossLeft.y * acrossRatio,
+    },
+    {
+      x: tr.x + alongTop.x * alongRatio - acrossRight.x * acrossRatio,
+      y: tr.y + alongTop.y * alongRatio - acrossRight.y * acrossRatio,
+    },
+    {
+      x: br.x + alongBottom.x * alongRatio + acrossRight.x * acrossRatio,
+      y: br.y + alongBottom.y * alongRatio + acrossRight.y * acrossRatio,
+    },
+    {
+      x: bl.x - alongBottom.x * alongRatio + acrossLeft.x * acrossRatio,
+      y: bl.y - alongBottom.y * alongRatio + acrossLeft.y * acrossRatio,
+    },
+  ];
+}
+
+// Classic Heckbert "square to quad" projective mapping: solves for the 3x3
+// matrix that maps the unit square (0,0),(1,0),(1,1),(0,1) onto an arbitrary
+// quad p0,p1,p2,p3, in closed form (no general matrix-inversion library needed).
+function squareToQuadMatrix(p0: Point, p1: Point, p2: Point, p3: Point) {
+  const dx1 = p1.x - p2.x;
+  const dy1 = p1.y - p2.y;
+  const dx2 = p3.x - p2.x;
+  const dy2 = p3.y - p2.y;
+  const sx = p0.x - p1.x + p2.x - p3.x;
+  const sy = p0.y - p1.y + p2.y - p3.y;
+
+  const denom = dx1 * dy2 - dx2 * dy1;
+  const g = denom !== 0 ? (sx * dy2 - dx2 * sy) / denom : 0;
+  const h = denom !== 0 ? (dx1 * sy - sx * dy1) / denom : 0;
+
+  const a = p1.x - p0.x + g * p1.x;
+  const b = p3.x - p0.x + h * p3.x;
+  const c = p0.x;
+  const d = p1.y - p0.y + g * p1.y;
+  const e = p3.y - p0.y + h * p3.y;
+  const f = p0.y;
+
+  return { a, b, c, d, e, f, g, h };
+}
+
+// Warps the quad (TL,TR,BR,BL, in source-pixel coordinates) into destCanvas as
+// a flat upright rectangle, via inverse mapping + bilinear sampling.
+function warpQuadToRect(
+  sourceCtx: CanvasRenderingContext2D,
+  srcW: number,
+  srcH: number,
+  corners: [Point, Point, Point, Point],
+  destCanvas: HTMLCanvasElement
+) {
+  const destCtx = destCanvas.getContext("2d");
+  if (!destCtx) return;
+
+  const destW = destCanvas.width;
+  const destH = destCanvas.height;
+
+  const M = squareToQuadMatrix(corners[0], corners[1], corners[2], corners[3]);
+
+  const srcImageData = sourceCtx.getImageData(0, 0, srcW, srcH);
+  const srcData = srcImageData.data;
+  const destImageData = destCtx.createImageData(destW, destH);
+  const destData = destImageData.data;
+
+  for (let py = 0; py < destH; py++) {
+    const v = py / destH;
+    for (let px = 0; px < destW; px++) {
+      const u = px / destW;
+
+      const w = M.g * u + M.h * v + 1;
+      const sx = (M.a * u + M.b * v + M.c) / w;
+      const sy = (M.d * u + M.e * v + M.f) / w;
+
+      const di = (py * destW + px) * 4;
+
+      if (sx < 0 || sy < 0 || sx >= srcW - 1 || sy >= srcH - 1) {
+        destData[di] = 0;
+        destData[di + 1] = 0;
+        destData[di + 2] = 0;
+        destData[di + 3] = 255;
+        continue;
+      }
+
+      const x0 = Math.floor(sx);
+      const y0 = Math.floor(sy);
+      const fx = sx - x0;
+      const fy = sy - y0;
+
+      for (let ch = 0; ch < 3; ch++) {
+        const i00 = (y0 * srcW + x0) * 4 + ch;
+        const i10 = (y0 * srcW + x0 + 1) * 4 + ch;
+        const i01 = ((y0 + 1) * srcW + x0) * 4 + ch;
+        const i11 = ((y0 + 1) * srcW + x0 + 1) * 4 + ch;
+
+        const top = srcData[i00] * (1 - fx) + srcData[i10] * fx;
+        const bottom = srcData[i01] * (1 - fx) + srcData[i11] * fx;
+        destData[di + ch] = top * (1 - fy) + bottom * fy;
+      }
+      destData[di + 3] = 255;
+    }
+  }
+
+  destCtx.putImageData(destImageData, 0, 0);
+}
+
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const mrzCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const sourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const sessionRef = useRef<ort.InferenceSession | null>(null);
   const runningRef = useRef(false);
   const busyRef = useRef(false);
   const needsSigmoidRef = useRef<boolean | null>(null);
+  const loggedDimsRef = useRef(false);
 
   const [status, setStatus] = useState("Loading model...");
   const [backend, setBackend] = useState("loading");
@@ -153,6 +281,12 @@ export default function Home() {
       }
 
       const dims = output.dims;
+
+      if (!loggedDimsRef.current) {
+        console.log("ONNX output dims:", dims);
+        loggedDimsRef.current = true;
+      }
+
       if (dims.length !== 3) {
         throw new Error(`Unexpected output shape: ${dims.join(",")}`);
       }
@@ -174,44 +308,32 @@ export default function Home() {
 
       const expectedChannels = 4 + NUM_CLASSES + NUM_KPTS * 3;
       if (channels !== expectedChannels) {
-        console.warn(`Expected ${expectedChannels} channels, got ${channels}. Dims: ${dims.join(",")}`);
+        throw new Error(`Expected ${expectedChannels} channels, got ${channels}. Dims: ${dims.join(",")}`);
       }
 
-      // Auto-detect if scores are raw logits or already probabilities
+      // Auto-detect if the class score is a raw logit or already a probability
       if (needsSigmoidRef.current === null) {
         let foundNegative = false;
         for (let a = 0; a < Math.min(anchors, 100); a++) {
-          for (let c = 0; c < NUM_CLASSES; c++) {
-            if (get(4 + c, a) < 0) {
-              foundNegative = true;
-              break;
-            }
+          if (get(4, a) < 0) {
+            foundNegative = true;
+            break;
           }
-          if (foundNegative) break;
         }
         needsSigmoidRef.current = foundNegative;
-        console.log(`Auto-detected class scores: ${foundNegative ? "Logits (using Sigmoid)" : "Probabilities"}`);
+        console.log(`Auto-detected class score: ${foundNegative ? "Logit (using Sigmoid)" : "Probability"}`);
       }
 
       const detections: Detection[] = [];
+      const kptBase = 4 + NUM_CLASSES;
 
       for (let a = 0; a < anchors; a++) {
-        let bestCls = 0;
-        let bestScore = -Infinity;
-
-        for (let c = 0; c < NUM_CLASSES; c++) {
-          let score = get(4 + c, a);
-          if (needsSigmoidRef.current) {
-            score = sigmoid(score);
-          }
-
-          if (score > bestScore) {
-            bestScore = score;
-            bestCls = c;
-          }
+        let score = get(4, a);
+        if (needsSigmoidRef.current) {
+          score = sigmoid(score);
         }
 
-        if (bestScore < CONF_THRES) continue;
+        if (score < CONF_THRES) continue;
 
         const cx = get(0, a);
         const cy = get(1, a);
@@ -223,14 +345,15 @@ export default function Home() {
         let x2 = cx + w / 2;
         let y2 = cy + h / 2;
 
-        // Scale and shift back using letterbox padding and scale
+        // Scale and shift back using letterbox padding and scale (the model
+        // sees a letterboxed 640x640 frame, not a plain stretch — this
+        // recovers native video pixel coordinates for both axes).
         x1 = (x1 - info.padX) / info.scale;
         y1 = (y1 - info.padY) / info.scale;
         x2 = (x2 - info.padX) / info.scale;
         y2 = (y2 - info.padY) / info.scale;
 
         const kpts = [];
-        const kptBase = 4 + NUM_CLASSES;
 
         for (let k = 0; k < NUM_KPTS; k++) {
           let kx = get(kptBase + k * 3, a);
@@ -258,8 +381,7 @@ export default function Home() {
             clamp(x2, 0, info.origW),
             clamp(y2, 0, info.origH),
           ],
-          score: bestScore,
-          cls: bestCls,
+          score,
           kpts,
         });
       }
@@ -290,7 +412,7 @@ export default function Home() {
       ctx.shadowColor = "rgba(0, 0, 0, 0.8)";
       ctx.shadowBlur = 4;
       ctx.fillText(
-        `${CLASS_NAMES[det.cls]} ${(det.score * 100).toFixed(1)}%`,
+        `${CLASS_NAME} ${(det.score * 100).toFixed(1)}%`,
         x1,
         Math.max(20, y1 - 8)
       );
@@ -310,11 +432,11 @@ export default function Home() {
         ctx.closePath();
         ctx.stroke();
 
-        // Colored keypoints: TL (blue), TR (yellow), BR (red), BL (cyan)
-        const colors = ["#3B82F6", "#FBBF24", "#EF4444", "#06B6D4"];
+        // Colored keypoints: TL red, TR orange, BR cyan, BL magenta —
+        // a wrong corner order is immediately visible on screen.
         for (let i = 0; i < 4; i++) {
           ctx.beginPath();
-          ctx.fillStyle = colors[i];
+          ctx.fillStyle = KPT_COLORS[i];
           ctx.arc(pts[i].x, pts[i].y, 7, 0, Math.PI * 2);
           ctx.fill();
           ctx.lineWidth = 2;
@@ -337,6 +459,7 @@ export default function Home() {
       const session = sessionRef.current;
       const video = videoRef.current;
       const overlay = overlayRef.current;
+      const mrzCanvas = mrzCanvasRef.current;
 
       if (!session || !video || !overlay || busyRef.current) {
         requestAnimationFrame(loop);
@@ -355,10 +478,39 @@ export default function Home() {
         const outputs = await session.run({ [inputName]: tensor });
         const output = outputs[outputName];
 
-        console.log("ONNX output dims:", output.dims);
-
         const detections = await parseOutput(output, info);
         drawDetections(overlay, detections);
+
+        if (mrzCanvas) {
+          const best = detections[0];
+
+          if (best && best.kpts.length >= 4) {
+            const corners = best.kpts.map((k) => ({ x: k.x, y: k.y })) as [
+              Point,
+              Point,
+              Point,
+              Point
+            ];
+            const expanded = expandQuad(corners, MRZ_EXPAND_ALONG, MRZ_EXPAND_ACROSS);
+
+            let sourceCanvas = sourceCanvasRef.current;
+            if (!sourceCanvas) {
+              sourceCanvas = document.createElement("canvas");
+              sourceCanvasRef.current = sourceCanvas;
+            }
+            sourceCanvas.width = video.videoWidth;
+            sourceCanvas.height = video.videoHeight;
+
+            const sourceCtx = sourceCanvas.getContext("2d");
+            if (sourceCtx) {
+              sourceCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
+              warpQuadToRect(sourceCtx, video.videoWidth, video.videoHeight, expanded, mrzCanvas);
+            }
+          } else {
+            const mrzCtx = mrzCanvas.getContext("2d");
+            mrzCtx?.clearRect(0, 0, mrzCanvas.width, mrzCanvas.height);
+          }
+        }
 
         const t1 = performance.now();
         setFps(1000 / Math.max(1, t1 - t0));
@@ -517,17 +669,31 @@ export default function Home() {
             </div>
           )}
 
-          <div className="relative w-full max-w-2xl aspect-video rounded-xl overflow-hidden bg-black shadow-inner">
+          <div className="relative w-full max-w-2xl rounded-xl overflow-hidden bg-black shadow-inner">
             <video
               ref={videoRef}
-              className="block w-full h-full object-cover"
+              className="block w-full h-auto max-h-[70vh] object-contain"
               playsInline
               muted
             />
 
             <canvas
               ref={overlayRef}
-              className="absolute left-0 top-0 w-full h-full object-cover pointer-events-none"
+              className="absolute left-0 top-0 w-full h-full object-contain pointer-events-none"
+            />
+          </div>
+        </div>
+
+        {/* Rectified MRZ strip — the actual product output. Must read upright
+            regardless of how the passport is held under the camera. */}
+        <div className="mt-6 w-full">
+          <h2 className="text-sm font-semibold text-slate-300 mb-2">Rectified MRZ Strip</h2>
+          <div className="w-full rounded-xl border border-slate-800 bg-black overflow-hidden flex items-center justify-center p-2">
+            <canvas
+              ref={mrzCanvasRef}
+              width={MRZ_STRIP_W}
+              height={MRZ_STRIP_H}
+              className="w-full max-w-2xl h-auto"
             />
           </div>
         </div>
