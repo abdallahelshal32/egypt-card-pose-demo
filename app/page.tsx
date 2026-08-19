@@ -3,32 +3,58 @@
 import { useEffect, useRef, useState } from "react";
 import * as ort from "onnxruntime-web";
 
-const MODEL_URL = "/yolo11n_pose_7class_v1.onnx?v=mrz1";
+const MODEL_URL = "/yolo11n_pose_9class_v1.onnx?v=cards9";
 const IMG_SIZE = 640;
-const NUM_CLASSES = 1;
+const NUM_CLASSES = 9;
 const NUM_KPTS = 4;
 const CONF_THRES = 0.35;
 const IOU_THRES = 0.45;
 
-const CLASS_NAME = "mrz_td3";
+// Order matters — index = class id trained into the model. Do not "fix" the
+// Car/Card typo on index 3; it must match the model's training labels.
+const CLASS_NAMES = [
+  "ID_Card_Front",
+  "ID_Card_Back",
+  "New_Card_Front",
+  "New_Car_Back",
+  "Old_Card_Front",
+  "Old_Card_Back",
+  "Other_Card",
+  "Old_License",
+  "New_License",
+];
+
+// Distinct per-class colour so a misclassification is visible at a glance.
+const CLASS_COLORS = [
+  "#10B981", // ID_Card_Front — emerald
+  "#06B6D4", // ID_Card_Back — cyan
+  "#8B5CF6", // New_Card_Front — violet
+  "#EC4899", // New_Car_Back — pink
+  "#F59E0B", // Old_Card_Front — amber
+  "#84CC16", // Old_Card_Back — lime
+  "#94A3B8", // Other_Card — slate
+  "#6366F1", // Old_License — indigo
+  "#14B8A6", // New_License — teal
+];
 
 const KPT_NAMES = ["TL", "TR", "BR", "BL"];
-// TL red, TR orange, BR cyan, BL magenta — wrong corner order is visible at a glance
-const KPT_COLORS = ["#EF4444", "#F97316", "#06B6D4", "#EC4899"];
+const KPT_COLORS = ["#EF4444", "#3B82F6", "#F97316", "#EAB308"]; // TL red, TR blue, BR orange, BL yellow
 
-// Target rectified strip. MRZ TD3 strip aspect is ~7:1.
-const MRZ_STRIP_W = 1000;
-const MRZ_STRIP_H = 156;
-// Quad expansion so the perspective warp doesn't clip the first/last characters
-// (the model predicts a tight box around the glyphs themselves).
-const MRZ_EXPAND_ALONG = 0.03; // along the text direction (TL-TR / BL-BR edges)
-const MRZ_EXPAND_ACROSS = 0.12; // across the text direction (TL-BL / TR-BR edges)
+// Target rectified panel. A card is ~1.6:1 (vs. the MRZ strip's old ~7:1).
+const CARD_RECT_W = 960;
+const CARD_RECT_H = 600;
+// Cards' keypoints mark the physical corners (not a tight glyph box like MRZ
+// had), so only a small pad is needed to avoid clipping the edge on a
+// slightly-under-predicted corner.
+const CARD_EXPAND_ALONG = 0.01;
+const CARD_EXPAND_ACROSS = 0.01;
 
 type Point = { x: number; y: number };
 
 type Detection = {
   box: [number, number, number, number];
   score: number;
+  classId: number;
   kpts: { x: number; y: number; conf: number }[];
 };
 
@@ -256,7 +282,7 @@ function warpQuadToRect(
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
-  const mrzCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cardCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const sourceCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const sessionRef = useRef<ort.InferenceSession | null>(null);
@@ -311,13 +337,15 @@ export default function Home() {
         throw new Error(`Expected ${expectedChannels} channels, got ${channels}. Dims: ${dims.join(",")}`);
       }
 
-      // Auto-detect if the class score is a raw logit or already a probability
+      // Auto-detect if the class scores are raw logits or already probabilities
       if (needsSigmoidRef.current === null) {
         let foundNegative = false;
-        for (let a = 0; a < Math.min(anchors, 100); a++) {
-          if (get(4, a) < 0) {
-            foundNegative = true;
-            break;
+        outer: for (let a = 0; a < Math.min(anchors, 100); a++) {
+          for (let c = 0; c < NUM_CLASSES; c++) {
+            if (get(4 + c, a) < 0) {
+              foundNegative = true;
+              break outer;
+            }
           }
         }
         needsSigmoidRef.current = foundNegative;
@@ -328,7 +356,18 @@ export default function Home() {
       const kptBase = 4 + NUM_CLASSES;
 
       for (let a = 0; a < anchors; a++) {
+        // Best class = argmax over ch 4..(4+NUM_CLASSES-1). Sigmoid is
+        // monotonic, so argmax on raw logits equals argmax on probabilities —
+        // only the winning score needs the sigmoid applied.
+        let classId = 0;
         let score = get(4, a);
+        for (let c = 1; c < NUM_CLASSES; c++) {
+          const s = get(4 + c, a);
+          if (s > score) {
+            score = s;
+            classId = c;
+          }
+        }
         if (needsSigmoidRef.current) {
           score = sigmoid(score);
         }
@@ -382,6 +421,7 @@ export default function Home() {
             clamp(y2, 0, info.origH),
           ],
           score,
+          classId,
           kpts,
         });
       }
@@ -400,19 +440,21 @@ export default function Home() {
       // Only draw the single best detection
       const det = detections[0];
       const [x1, y1, x2, y2] = det.box;
+      const classColor = CLASS_COLORS[det.classId] ?? "#10B981";
+      const className = CLASS_NAMES[det.classId] ?? `class_${det.classId}`;
 
-      // Bounding Box (Green)
+      // Bounding box, colour-coded per class
       ctx.lineWidth = 3;
-      ctx.strokeStyle = "#10B981"; // Emerald green
+      ctx.strokeStyle = classColor;
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
 
       // Label class name and confidence
       ctx.font = "bold 16px sans-serif";
-      ctx.fillStyle = "#10B981";
+      ctx.fillStyle = classColor;
       ctx.shadowColor = "rgba(0, 0, 0, 0.8)";
       ctx.shadowBlur = 4;
       ctx.fillText(
-        `${CLASS_NAME} ${(det.score * 100).toFixed(1)}%`,
+        `${className} ${(det.score * 100).toFixed(1)}%`,
         x1,
         Math.max(20, y1 - 8)
       );
@@ -421,9 +463,9 @@ export default function Home() {
       const pts = det.kpts;
 
       if (pts.length >= 4) {
-        // Magenta polygon connecting TL -> TR -> BR -> BL
+        // Polygon connecting TL -> TR -> BR -> BL, colour-coded per class
         ctx.lineWidth = 4;
-        ctx.strokeStyle = "#EC4899"; // Magenta
+        ctx.strokeStyle = classColor;
         ctx.beginPath();
         ctx.moveTo(pts[0].x, pts[0].y); // TL
         ctx.lineTo(pts[1].x, pts[1].y); // TR
@@ -432,7 +474,7 @@ export default function Home() {
         ctx.closePath();
         ctx.stroke();
 
-        // Colored keypoints: TL red, TR orange, BR cyan, BL magenta —
+        // Colored keypoints: TL red, TR blue, BR orange, BL yellow —
         // a wrong corner order is immediately visible on screen.
         for (let i = 0; i < 4; i++) {
           ctx.beginPath();
@@ -459,7 +501,7 @@ export default function Home() {
       const session = sessionRef.current;
       const video = videoRef.current;
       const overlay = overlayRef.current;
-      const mrzCanvas = mrzCanvasRef.current;
+      const cardCanvas = cardCanvasRef.current;
 
       if (!session || !video || !overlay || busyRef.current) {
         requestAnimationFrame(loop);
@@ -481,7 +523,7 @@ export default function Home() {
         const detections = await parseOutput(output, info);
         drawDetections(overlay, detections);
 
-        if (mrzCanvas) {
+        if (cardCanvas) {
           const best = detections[0];
 
           if (best && best.kpts.length >= 4) {
@@ -491,7 +533,7 @@ export default function Home() {
               Point,
               Point
             ];
-            const expanded = expandQuad(corners, MRZ_EXPAND_ALONG, MRZ_EXPAND_ACROSS);
+            const expanded = expandQuad(corners, CARD_EXPAND_ALONG, CARD_EXPAND_ACROSS);
 
             let sourceCanvas = sourceCanvasRef.current;
             if (!sourceCanvas) {
@@ -504,11 +546,11 @@ export default function Home() {
             const sourceCtx = sourceCanvas.getContext("2d");
             if (sourceCtx) {
               sourceCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight);
-              warpQuadToRect(sourceCtx, video.videoWidth, video.videoHeight, expanded, mrzCanvas);
+              warpQuadToRect(sourceCtx, video.videoWidth, video.videoHeight, expanded, cardCanvas);
             }
           } else {
-            const mrzCtx = mrzCanvas.getContext("2d");
-            mrzCtx?.clearRect(0, 0, mrzCanvas.width, mrzCanvas.height);
+            const cardCtx = cardCanvas.getContext("2d");
+            cardCtx?.clearRect(0, 0, cardCanvas.width, cardCanvas.height);
           }
         }
 
@@ -684,15 +726,15 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Rectified MRZ strip — the actual product output. Must read upright
-            regardless of how the passport is held under the camera. */}
+        {/* Rectified card — the actual product output. Must read upright
+            regardless of how the card is held under the camera. */}
         <div className="mt-6 w-full">
-          <h2 className="text-sm font-semibold text-slate-300 mb-2">Rectified MRZ Strip</h2>
+          <h2 className="text-sm font-semibold text-slate-300 mb-2">Rectified Card</h2>
           <div className="w-full rounded-xl border border-slate-800 bg-black overflow-hidden flex items-center justify-center p-2">
             <canvas
-              ref={mrzCanvasRef}
-              width={MRZ_STRIP_W}
-              height={MRZ_STRIP_H}
+              ref={cardCanvasRef}
+              width={CARD_RECT_W}
+              height={CARD_RECT_H}
               className="w-full max-w-2xl h-auto"
             />
           </div>
